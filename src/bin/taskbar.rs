@@ -305,6 +305,8 @@ struct App {
     main_tray: RECT,
     /// Every copy on another monitor knows its place: the strips appear on all taskbars together.
     mirrors_ready: bool,
+    primary_has_space: bool,
+    mirror_has_space: bool,
     /// Strips popping in or out (strip, start, leaving): copies on other monitors, and the main
     /// strip when the widget moves to or from another monitor. A copy that left is destroyed, the
     /// main strip hidden, once it has popped out.
@@ -995,6 +997,7 @@ impl App {
     /// Renders the strip and hands it to the layered window.
     fn paint(&mut self) {
         if self.fallback {
+            self.painted_for = Default::default();
             self.sync_tray();
             return;
         }
@@ -1449,12 +1452,6 @@ impl App {
         }
         if !self.fallback {
             self.paint();
-            // While copies on other monitors still wait for their place, place() shows it with them.
-            if !self.primary_hidden && self.mirrors_ready {
-                unsafe {
-                    let _ = ShowWindow(self.strip, SW_SHOWNOACTIVATE);
-                }
-            }
         }
         true
     }
@@ -1514,17 +1511,26 @@ impl App {
         if self.ensure_strip() {
             self.remove_orphan_strips();
             self.fail_ticks = 0;
-            if self.fallback {
-                self.set_fallback(false);
-            }
-            // Re-render when the taskbar changed height, DPI or theme since the last render
-            // (e.g. after leaving a full-screen game).
+            // Keep the tray icons while trying placement. Only remove them once a strip is visible.
+            let was_fallback = self.fallback;
+            self.fallback = false;
             if self.render_target() != self.painted_for {
                 self.paint();
-            } else {
-                self.place();
             }
             self.sync_mirrors();
+            self.place();
+            if self.primary_has_space || self.mirror_has_space {
+                if was_fallback {
+                    self.remove_tray();
+                }
+            } else if was_fallback {
+                self.fallback = true;
+                if self.tray.is_empty() {
+                    self.sync_tray();
+                }
+            } else {
+                self.set_fallback(true);
+            }
         } else {
             self.fail_ticks += 1;
             if self.fail_ticks >= FALLBACK_AFTER_TICKS {
@@ -1634,6 +1640,7 @@ impl App {
             }
         }
         let mut pending = false;
+        self.mirror_has_space = false;
         for i in 0..self.mirrors.len() {
             pending |= self.place_mirror_at(i);
         }
@@ -1726,7 +1733,8 @@ impl App {
     fn place_mirror_at(&mut self, i: usize) -> bool {
         let (bar, strip) = self.mirrors[i];
         let was = unsafe { IsWindowVisible(strip).as_bool() };
-        let pending = self.place_mirror(bar, strip);
+        let (pending, has_space) = self.place_mirror(bar, strip);
+        self.mirror_has_space |= has_space;
         if !was && unsafe { IsWindowVisible(strip).as_bool() } {
             self.start_pop(strip, false);
         } else if !self.popping(strip) && unsafe { IsWindowVisible(strip).as_bool() } {
@@ -1816,8 +1824,8 @@ impl App {
     /// Places a copy just left of the secondary taskbar's clock (Windows 10 / ExplorerPatcher
     /// layout), or, when there is no clock window (Windows 11 draws it itself), just left of the
     /// first notification-area item that UI Automation reports (see tray_probe).
-    /// Returns true while the copy is hidden because its place is not known yet.
-    fn place_mirror(&self, bar: HWND, strip: HWND) -> bool {
+    /// Returns whether measurement is pending and whether the copy has a usable position.
+    fn place_mirror(&self, bar: HWND, strip: HWND) -> (bool, bool) {
         unsafe {
             // A copy is a topmost window of its own: it must not stay over a full-screen game or
             // video on that monitor (the taskbar itself goes behind those).
@@ -1825,7 +1833,7 @@ impl App {
                 if IsWindowVisible(strip).as_bool() {
                     let _ = ShowWindow(strip, SW_HIDE);
                 }
-                return false;
+                return (false, false);
             }
             let mut br = RECT::default();
             let _ = GetWindowRect(bar, &mut br);
@@ -1837,7 +1845,7 @@ impl App {
                 // vertical copy only fits when the main taskbar is vertical too.
                 if !self.vertical {
                     let _ = ShowWindow(strip, SW_HIDE);
-                    return false;
+                    return (false, false);
                 }
                 dbg_log(&format!("mirror: vertical bar {bar:?} rect {},{},{},{} main vertical {}", br.left, br.top, br.right, br.bottom, self.vertical));
                 let bottom = match FindWindowExW(Some(bar), None, w!("ClockButton"), None) {
@@ -1850,7 +1858,7 @@ impl App {
                     // Automation where its notification-area items start, as for horizontal ones.
                     _ => match batteryhub::tray_probe::tray_left(bar, br, self.main, WM_TRAY_PROBED) {
                         batteryhub::tray_probe::TrayEdge::Known(y) => y,
-                        batteryhub::tray_probe::TrayEdge::Pending => return true,
+                        batteryhub::tray_probe::TrayEdge::Pending => return (true, false),
                         batteryhub::tray_probe::TrayEdge::Unknown => br.bottom - (130.0 * s) as i32,
                     },
                 };
@@ -1864,9 +1872,11 @@ impl App {
                 let _ = GetClientRect(bar, &mut client);
                 let left = ((client.right - self.size.cx) / 2).max(0);
                 self.show_mirror_at(bar, strip, left, top.max(0), self.size);
-                return false;
+                return (false, true);
             }
-            let right = match FindWindowExW(Some(bar), None, w!("ClockButton"), None) {
+            let clock = FindWindowExW(Some(bar), None, w!("ClockButton"), None);
+            let native_clock = clock.as_ref().is_ok_and(|&clock| IsWindowVisible(clock).as_bool());
+            let right = match clock {
                 Ok(clock) if !clock.0.is_null() && IsWindowVisible(clock).as_bool() => {
                     let mut cr = RECT::default();
                     let _ = GetWindowRect(clock, &mut cr);
@@ -1878,7 +1888,7 @@ impl App {
                     batteryhub::tray_probe::TrayEdge::Known(x) => x,
                     // Not known yet (well under a second): stay hidden rather than show the copy in
                     // the wrong place; WM_TRAY_PROBED places it as soon as the answer is there.
-                    batteryhub::tray_probe::TrayEdge::Pending => return true,
+                    batteryhub::tray_probe::TrayEdge::Pending => return (true, false),
                     batteryhub::tray_probe::TrayEdge::Unknown => br.right - (130.0 * s) as i32,
                 },
             };
@@ -1892,8 +1902,16 @@ impl App {
             let mut client = RECT::default();
             let _ = GetClientRect(bar, &mut client);
             let top = ((client.bottom - self.size.cy) / 2).max(0);
+            let fits_xaml = self.fits_after_app_buttons(bar, br, left, s);
+            let classic = native_clock || batteryhub::tray_probe::app_layout(bar).is_some_and(|(xaml, _)| !xaml);
+            let worker = classic.then(|| FindWindowExW(Some(bar), None, w!("WorkerW"), None).ok()).flatten();
+            if left < client.left || (worker.is_none() && !fits_xaml)
+            {
+                let _ = ShowWindow(strip, SW_HIDE);
+                return (false, false);
+            }
             // Narrow the task buttons so they never slide under the copy.
-            if let Ok(worker) = FindWindowExW(Some(bar), None, w!("WorkerW"), None) {
+            if let Some(worker) = worker {
                 let mut wr = RECT::default();
                 let _ = GetWindowRect(worker, &mut wr);
                 let mut tl = POINT { x: wr.left, y: wr.top };
@@ -1904,7 +1922,7 @@ impl App {
             }
             self.show_mirror_at(bar, strip, left, top, self.size);
         }
-        false
+        (false, true)
     }
 
     /// Moves a copy to `left`, `top` (client coordinates of its taskbar) unless it is already there.
@@ -2011,8 +2029,19 @@ impl App {
     }
 
     /// Keeps the strip just left of the notification area (checked every second, like the original).
+    fn fits_after_app_buttons(&self, bar: HWND, rect: RECT, left: i32, scale: f32) -> bool {
+        use batteryhub::tray_probe::{self, TrayEdge};
+        if tray_probe::tray_left(bar, rect, self.main, WM_TRAY_PROBED) == TrayEdge::Pending {
+            return false;
+        }
+        tray_probe::app_layout(bar).is_some_and(|(_, right)| {
+            right.is_none_or(|right| rect.left + left >= right + (4.0 * scale).round() as i32)
+        })
+    }
+
     fn place(&mut self) {
-        if self.strip.0.is_null() || self.primary_hidden || !self.mirrors_ready {
+        self.primary_has_space = false;
+        if self.fallback || self.strip.0.is_null() || self.primary_hidden || !self.mirrors_ready {
             return;
         }
         unsafe {
@@ -2035,6 +2064,7 @@ impl App {
                 let top = top.max(0);
                 let left = ((client.right - self.size.cx) / 2).max(0);
                 let covered = GetWindow(self.strip, GW_HWNDPREV).is_ok_and(|h| !h.0.is_null()) || !IsWindowVisible(self.strip).as_bool();
+                self.primary_has_space = true;
                 let key = (tr, bar, top);
                 if !covered && self.last_place == key {
                     return;
@@ -2057,7 +2087,10 @@ impl App {
             let top = ((client.bottom - self.size.cy) / 2).max(0);
 
             // Windows 10 / ExplorerPatcher taskbar: narrow the task buttons so they never slide under us.
-            if let Ok(rebar) = FindWindowExW(Some(self.taskbar), None, w!("ReBarWindow32"), None) {
+            let fits_xaml = self.fits_after_app_buttons(self.taskbar, bar, left, self.scale());
+            let xaml_host = FindWindowExW(Some(self.taskbar), None, w!("Windows.UI.Composition.DesktopWindowContentBridge"), None).is_ok();
+            let classic = batteryhub::tray_probe::app_layout(self.taskbar).is_none_or(|(xaml, _)| !xaml) && !xaml_host;
+            if let Some(rebar) = classic.then(|| FindWindowExW(Some(self.taskbar), None, w!("ReBarWindow32"), None).ok()).flatten() {
                 let mut rr = RECT::default();
                 let _ = GetWindowRect(rebar, &mut rr);
                 let mut tl = POINT { x: rr.left, y: rr.top };
@@ -2065,8 +2098,19 @@ impl App {
                 if tl.x + (rr.right - rr.left) > left && left > tl.x {
                     let _ = MoveWindow(rebar, tl.x, tl.y, left - tl.x, rr.bottom - rr.top, true);
                 }
+            } else if !fits_xaml {
+                self.hide_tip();
+                let _ = ShowWindow(self.strip, SW_HIDE);
+                self.last_place = Default::default();
+                return;
+            }
+            if left < client.left {
+                let _ = ShowWindow(self.strip, SW_HIDE);
+                self.last_place = Default::default();
+                return;
             }
             let covered = GetWindow(self.strip, GW_HWNDPREV).is_ok_and(|h| !h.0.is_null()) || !IsWindowVisible(self.strip).as_bool();
+            self.primary_has_space = true;
             let key = (tr, bar, left);
             if !covered && self.last_place == key {
                 return;
@@ -4157,7 +4201,6 @@ unsafe fn show_menu(from: Option<HWND>) {
                         if a.icons_mode {
                             a.set_fallback(true);
                         } else {
-                            a.set_fallback(false);
                             a.tick();
                         }
                         a.icons_mode
@@ -4761,7 +4804,13 @@ extern "system" fn main_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LR
                     TIMER_QUICK => a.start_quick(),
                     TIMER_NOTIFY => a.end_notify(),
                     TIMER_AWAY => a.away_step(),
-                    TIMER_SLIDE => a.paint(),
+                    TIMER_SLIDE => {
+                        if a.fallback {
+                            let _ = KillTimer(Some(hwnd), TIMER_SLIDE);
+                        } else {
+                            a.paint();
+                        }
+                    }
                     TIMER_MIRROR_IN => a.mirror_in_step(),
                     TIMER_UPDATED => {
                         let _ = KillTimer(Some(hwnd), TIMER_UPDATED);
